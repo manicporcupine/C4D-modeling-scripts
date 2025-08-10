@@ -1,0 +1,137 @@
+# Align Spline Points on X, then Y, then Z
+# Groups consider ALL points; when selection exists:
+#   - move ONLY selected points,
+#   - group center is computed ONLY from selected points in that group.
+# If no selection: move ALL points and center = average of ALL points.
+
+import c4d
+from c4d import gui
+
+def get_threshold(default=0.1):
+    txt = gui.InputDialog("Threshold (object units)", str(default))
+    if txt is None:
+        return None
+    try:
+        return float(txt)
+    except ValueError:
+        gui.MessageDialog("Please enter a numeric value.")
+        return None
+
+def get_selected_indices(spline):
+    bs = spline.GetPointS()
+    if not bs:
+        return []
+    cnt = spline.GetPointCount()
+    return [i for i in range(cnt) if bs.IsSelected(i)]
+
+def group_and_snap(points, axis_idx, thr, movable_set, use_selected_center):
+    """
+    Build groups along axis_idx using ALL points with 'thr'.
+    For each group:
+      - compute target as average of SELECTED points in the group if use_selected_center=True and any are present;
+        otherwise use average of ALL points in the group.
+      - move only indices in movable_set.
+    """
+    if not points:
+        return points
+
+    # (axis_value, index) for ALL points
+    vals = []
+    for i, p in enumerate(points):
+        v = p.x if axis_idx == 0 else p.y if axis_idx == 1 else p.z
+        vals.append((v, i))
+    vals.sort(key=lambda t: t[0])
+
+    # Group contiguous values within threshold
+    groups = []
+    cur = [vals[0]]
+    seed = vals[0][0]
+    for v, idx in vals[1:]:
+        if abs(v - seed) <= thr:
+            cur.append((v, idx))
+        else:
+            groups.append(cur)
+            cur = [(v, idx)]
+        seed = v
+    groups.append(cur)
+
+    new_pts = list(points)
+    for grp in groups:
+        if len(grp) < 2:
+            continue  # ignore singletons to avoid accidental nudges
+
+        # Split indices into selected vs all
+        sel_vals = [(v, i) for (v, i) in grp if i in movable_set] if use_selected_center else []
+        if use_selected_center and sel_vals:
+            target = sum(v for v, _ in sel_vals) / float(len(sel_vals))
+        else:
+            target = sum(v for v, _ in grp) / float(len(grp))
+
+        # Move only movable_set indices
+        for _, i in grp:
+            if i not in movable_set:
+                continue
+            p = c4d.Vector(new_pts[i])
+            if axis_idx == 0:   p.x = target
+            elif axis_idx == 1: p.y = target
+            else:               p.z = target
+            new_pts[i] = p
+
+    return new_pts
+
+def process_spline(sp, thr):
+    if not isinstance(sp, c4d.SplineObject):
+        return False
+
+    pts = list(sp.GetAllPoints())
+    if not pts:
+        return False
+
+    sel = set(get_selected_indices(sp))
+    if sel:
+        movable = sel                       # move only selected
+        use_selected_center = True          # centers from selected-only
+    else:
+        movable = set(range(len(pts)))      # move all
+        use_selected_center = False         # centers from all points
+
+    # Align along X -> Y -> Z
+    pts = group_and_snap(pts, 0, thr, movable, use_selected_center)
+    pts = group_and_snap(pts, 1, thr, movable, use_selected_center)
+    pts = group_and_snap(pts, 2, thr, movable, use_selected_center)
+
+    sp.SetAllPoints(pts)
+    sp.Message(c4d.MSG_UPDATE)
+    return True
+
+def main():
+    doc = c4d.documents.GetActiveDocument()
+    thr = get_threshold(0.1)
+    if thr is None:
+        return
+
+    targets = [o for o in doc.GetActiveObjects(c4d.GETACTIVEOBJECTFLAGS_CHILDREN)
+               if isinstance(o, c4d.SplineObject)]
+    if not targets:
+        o = doc.GetActiveObject()
+        if isinstance(o, c4d.SplineObject):
+            targets = [o]
+        else:
+            gui.MessageDialog("Select at least one SplineObject.")
+            return
+
+    doc.StartUndo()
+    try:
+        changed = 0
+        for sp in targets:
+            doc.AddUndo(c4d.UNDOTYPE_CHANGE, sp)
+            if process_spline(sp, thr):
+                changed += 1
+        if changed == 0:
+            gui.MessageDialog("No spline points were modified.")
+    finally:
+        doc.EndUndo()
+        c4d.EventAdd()
+
+if __name__ == "__main__":
+    main()
