@@ -1,85 +1,73 @@
 import c4d
 from c4d import utils
 
-# --- user data helpers (check UD by name; no dict .get) ---
-def _ensure_real_ud(op, name, default, minv=0.0, maxv=1e9, step=0.1):
+# -- minimal UD (Link + Radius + Flat) --
+def _ensure_link(op, name):
     for did, bc in op.GetUserDataContainer():
-        if bc[c4d.DESC_NAME] == name:
-            return did
-    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_REAL)
+        if bc[c4d.DESC_NAME] == name: return did
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_BASELISTLINK)
     bc[c4d.DESC_NAME] = name
-    bc[c4d.DESC_MIN] = minv
-    bc[c4d.DESC_MAX] = maxv
-    bc[c4d.DESC_STEP] = step
-    did = op.AddUserData(bc)
-    op[did] = float(default)
+    did = op.AddUserData(bc); op[did] = None
     return did
 
-def _ensure_bool_ud(op, name, default):
+def _ensure_real(op, name, default, minv=0.0, maxv=1e9, step=0.1):
     for did, bc in op.GetUserDataContainer():
-        if bc[c4d.DESC_NAME] == name:
-            return did
+        if bc[c4d.DESC_NAME] == name: return did
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_REAL)
+    bc[c4d.DESC_NAME] = name; bc[c4d.DESC_MIN] = minv; bc[c4d.DESC_MAX] = maxv; bc[c4d.DESC_STEP] = step
+    did = op.AddUserData(bc); op[did] = float(default)
+    return did
+
+def _ensure_bool(op, name, default):
+    for did, bc in op.GetUserDataContainer():
+        if bc[c4d.DESC_NAME] == name: return did
     bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_BOOL)
     bc[c4d.DESC_NAME] = name
-    did = op.AddUserData(bc)
-    op[did] = bool(default)
+    did = op.AddUserData(bc); op[did] = bool(default)
     return did
 
-def ensure_user_data_and_get(op):
-    radius_id = _ensure_real_ud(op, "Radius", 5.0, minv=0.0, maxv=1e9, step=0.1)
-    flat_id   = _ensure_bool_ud(op, "Flat", False)
-    return radius_id, flat_id
-
-# --- core ---
-def chamfer_spline(src, radius, flat):
-    if src is None or not isinstance(src, c4d.SplineObject):
+# -- core: clone + run native Spline Chamfer in a temp doc --
+def _chamfer_spline(src_spline, radius, flat):
+    if not isinstance(src_spline, c4d.SplineObject):
         return None
 
-    clone = src.GetClone(c4d.COPYFLAGS_0)
-    temp = c4d.documents.BaseDocument()
-    temp.InsertObject(clone)
-    temp.SetActiveObject(clone)
+    clone = src_spline.GetClone(c4d.COPYFLAGS_0)
 
-    # select all points
+    # Work in a temp doc (recommended for modeling commands).
+    tdoc = c4d.documents.BaseDocument()
+    tdoc.InsertObject(clone); tdoc.SetActiveObject(clone)
+
+    # Select all points so the tool affects every corner.
     psel = c4d.SelectionTag(c4d.Tpointselection)
     psel.GetBaseSelect().SelectAll(clone.GetPointCount())
     clone.InsertTag(psel)
 
-    r = 0.0 if radius is None else float(max(radius, 0.0))
-    f = False if flat is None else bool(flat)
-
+    # Tool params (official IDs).
     bc = c4d.BaseContainer()
-    bc[c4d.MDATA_SPLINE_CHAMFERRADIUS] = r
-    bc[c4d.MDATA_SPLINE_CHAMFERFLAT]   = f
+    bc[c4d.MDATA_SPLINE_CHAMFERRADIUS] = max(float(radius or 0.0), 0.0)
+    bc[c4d.MDATA_SPLINE_CHAMFERFLAT]   = bool(flat)
 
     ok = utils.SendModelingCommand(
         command=c4d.ID_MODELING_SPLINE_CHAMFER_TOOL,
-        list=[clone],
-        bc=bc,
-        mode=c4d.MODELINGCOMMANDMODE_ALL,
-        doc=temp
+        list=[clone], bc=bc,
+        mode=c4d.MODELINGCOMMANDMODE_ALL, doc=tdoc
     )
     if not ok:
         return None
 
-    clone.Remove()
+    clone.Remove()   # detach from temp doc; return a plain SplineObject
     return clone
 
-def GetFirstChildSpline(op):
-    ch = op.GetDown()
-    while ch:
-        if isinstance(ch, c4d.SplineObject):
-            return ch
-        ch = ch.GetNext()
-    return None
-
 def main():
-    radius_id, flat_id = ensure_user_data_and_get(op)
-    radius = op[radius_id]
-    flat   = op[flat_id]
+    link_id   = _ensure_link(op, "Source Spline")
+    radius_id = _ensure_real(op, "Radius", 5.0, minv=0.0)
+    flat_id   = _ensure_bool(op, "Flat (straight bevel)", False)
 
-    src = GetFirstChildSpline(op)
-    if src is None:
+    src = op[link_id]
+    if not isinstance(src, c4d.SplineObject):
         return None
 
-    return chamfer_spline(src, radius, flat)
+    # Light touches so edits to the source tend to dirty upstream states.
+    _ = src.GetMg(); _ = src.GetPointCount()
+
+    return _chamfer_spline(src, op[radius_id], op[flat_id])
