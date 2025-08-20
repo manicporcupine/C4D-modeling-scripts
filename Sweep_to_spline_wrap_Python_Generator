@@ -1,0 +1,167 @@
+# Straighten evaluated spline along +Z + build Sweep (Profile link)
+# - Reads path via UD Link "Path"
+# - Samples evaluated points via c4d.utils.SplineHelp (interpolation-aware)
+# - Output: if Profile is set -> return a Sweep (profile + straightened path)
+#            else -> return the straightened path spline
+# - If source path is closed, append an extra point for the closing edge length
+# Cinema 4D 2024/2025
+import c4d
+from c4d import utils, documents as docs
+
+UD_PATH_NAME    = "Path"     # User Data (Link) with the source path spline (any spline object/generator)
+UD_PROFILE_NAME = "Profile"  # User Data (Link) with the profile spline
+
+# --- helpers ---------------------------------------------------------------
+def _ensure_link_ud(op, name):
+    """Ensure a Link-type User Data with label `name` exists; return its DescID."""
+    for did, bc in (op.GetUserDataContainer() or []):
+        if bc[c4d.DESC_NAME] == name:
+            return did
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_BASELISTLINK)
+    bc[c4d.DESC_NAME] = name
+    bc[c4d.DESC_ANIMATE] = c4d.DESC_ANIMATE_OFF
+    return op.AddUserData(bc)
+
+def _evaluated_world_points(spl_obj: c4d.BaseObject):
+    """Return *evaluated* (interpolated) points of a spline using SplineHelp.
+    Honors the spline's Intermediate Points settings. Returns points in world space."""
+    sh = utils.SplineHelp()
+    flags = (c4d.SPLINEHELPFLAGS_GLOBALSPACE |
+             c4d.SPLINEHELPFLAGS_RETAINLINEOBJECT |
+             c4d.SPLINEHELPFLAGS_CONTINUECURVE)
+    if not sh.InitSplineWith(spl_obj, flags):
+        return []
+    line = sh.GetLineObject()  # c4d.LineObject with evaluated vertices
+    if line is None or line.GetPointCount() == 0:
+        return []
+    return list(line.GetAllPoints())  # already global due to GLOBALSPACE
+
+def _straighten_along_z_from_points(pts, closed: bool):
+    """Build points on +Z, preserving consecutive edge lengths of `pts`.
+    If closed=True, append an extra last point for the closing edge (last->first)."""
+    n = len(pts)
+    if n == 0:
+        return []
+    out = [c4d.Vector(0.0, 0.0, 0.0)]
+    z = 0.0
+    for i in range(1, n):
+        z += (pts[i] - pts[i - 1]).GetLength()
+        out.append(c4d.Vector(0.0, 0.0, z))
+    if closed and n >= 2:
+        z += (pts[0] - pts[-1]).GetLength()
+        out.append(c4d.Vector(0.0, 0.0, z))
+    return out
+
+def _first_spline_in_hierarchy(root: c4d.BaseObject):
+    """DFS: return first SplineObject found in a hierarchy."""
+    def dfs(node: c4d.BaseObject):
+        while node:
+            if isinstance(node, c4d.SplineObject):
+                return node
+            d = dfs(node.GetDown())
+            if d:
+                return d
+            node = node.GetNext()
+        return None
+    return dfs(root)
+
+def _csto_first_spline(src: c4d.BaseObject):
+    """Return an evaluated SplineObject from `src` via temporary CSTO.
+    Detaches it from the temp doc and resets its transform to identity."""
+    if not isinstance(src, c4d.BaseObject):
+        return None
+    clone = src.GetClone(c4d.COPYFLAGS_NO_HIERARCHY | c4d.COPYFLAGS_NO_ANIMATION | c4d.COPYFLAGS_NO_BITS)
+    if clone is None:
+        return None
+    tmp = docs.BaseDocument()
+    tmp.InsertObject(clone)
+    res = utils.SendModelingCommand(
+        command=c4d.MCOMMAND_CURRENTSTATETOOBJECT,
+        list=[clone],
+        doc=tmp
+    )
+    root = res[0] if isinstance(res, list) and res else (res if isinstance(res, c4d.BaseObject) else None)
+    if root is None:
+        return None
+    out = _first_spline_in_hierarchy(root)
+    if out is None:
+        return None
+    out.Remove()                 # detach from temp doc
+    out.SetMg(c4d.Matrix())      # reset to generator local space (origin)
+    out.SetName("Profile (eval)")
+    return out
+
+# --- main ------------------------------------------------------------------
+def main():
+    # Ensure UD links exist
+    did_path = _ensure_link_ud(op, UD_PATH_NAME)
+    did_prof = _ensure_link_ud(op, UD_PROFILE_NAME)
+
+    src_path = op[did_path]
+    if not isinstance(src_path, c4d.BaseObject):
+        return None
+
+    # Evaluated points from the path (Intermediate Points honored)
+    pts_eval = _evaluated_world_points(src_path)
+    if not pts_eval:
+        return None
+
+    # Straighten along +Z
+    # Note: read closed flag if object supports it; otherwise assume open
+    closed = False
+    try:
+        closed = bool(src_path[c4d.SPLINEOBJECT_CLOSED])
+    except Exception:
+        closed = False
+    pts_line = _straighten_along_z_from_points(pts_eval, closed)
+    m = len(pts_line)
+    if m == 0:
+        return None
+
+    # Build the straightened path spline (always OPEN, linear)
+    path = c4d.SplineObject(m, 1)
+    path.SetName("Path (straightened)")
+    path[c4d.SPLINEOBJECT_TYPE] = c4d.SPLINEOBJECT_TYPE_LINEAR
+    path[c4d.SPLINEOBJECT_CLOSED] = False
+    path.ResizeObject(m, 1)
+    path.SetSegment(0, m, False)
+    for i, p in enumerate(pts_line):
+        path.SetPoint(i, p)
+    path.Message(c4d.MSG_UPDATE)
+
+    # PROFILE: use linked profile if provided; otherwise, create a default Circle (diameter 1 cm)
+    src_prof = op[did_prof]
+    prof_spline = None
+    if src_prof is not None:
+        prof_spline = _csto_first_spline(src_prof)
+    if prof_spline is None:
+        # default Circle profile with diameter 1 cm => radius 0.5 cm
+        prof_spline = c4d.BaseObject(c4d.Osplinecircle)
+        prof_spline[c4d.PRIM_CIRCLE_RADIUS] = 0.5  # 0.5 cm radius
+        prof_spline.SetName("Profile (circle 1cm)")
+
+    # Create a standard Sweep and insert children in order [profile, path]
+    sweep = c4d.BaseObject(c4d.Osweep)
+    sweep.SetName("Sweep")
+
+    # Insert order: make path second by inserting it first, then profile (InsertUnder makes newest first child)
+    path.InsertUnder(sweep)
+    prof_spline.InsertUnder(sweep)
+
+    # Build a Null container so Spline Wrap is a sibling of the Sweep (same parent)
+    root = c4d.BaseObject(c4d.Onull)
+    root.SetName("Wrapped Sweep")
+
+    # Put Sweep under the Null first
+    sweep.InsertUnder(root)
+
+    # Apply Spline Wrap to the Sweep: sibling under the same Null, axis -Z, using ORIGINAL path
+    sw = c4d.BaseObject(c4d.Omgsplinewrap)
+    sw.SetName("Spline Wrap")
+    sw[c4d.MGSPLINEWRAPDEFORMER_SPLINE] = src_path
+    sw[c4d.MGSPLINEWRAPDEFORMER_AXIS] = c4d.MGSPLINEWRAPDEFORMER_AXIS_ZP  # -Z
+    sw[c4d.MGSPLINEWRAPDEFORMER_LENMODE] = c4d.MGSPLINEWRAPDEFORMER_LENMODE_FIT
+    sw[c4d.MGSPLINEWRAPDEFORMER_STRENGTH] = 1.0
+    sw.InsertUnder(root)  # sibling under the same parent (Null)
+
+    return root
