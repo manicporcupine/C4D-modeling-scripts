@@ -1,0 +1,426 @@
+# Sweep Islands Splitter — by Link (LIVE, strict order Profile↑ / Path↓)
+# ALWAYS outputs one merged PolygonObject (baked)
+# UI:
+#   - "Source Sweep" (Object Link)
+#   - "UV Rotate (°)" (Float Slider, degrees; step=90°, limits [-180 .. +180])
+#
+# Rules:
+#   - In "Source Sweep": top child = PROFILE, bottom child = PATH
+#   - If PATH spline has >1 segment => Explode Segments => each island gets its own Sweep
+#   - Sweep params copied 1:1; for baking we use REAL clones (no Instance) to avoid empty caches
+#   - Path can be a Connect with multiple splines (handled)
+
+import c4d
+import math
+from c4d import utils, documents as docs
+
+UD_LINK_NAME      = "Source Sweep"
+UD_UV_ANGLE_NAME  = "UV Rotate (°)"
+
+# ────────────────────────────── User Data ──────────────────────────────
+
+def _ensure_link_ud(op):
+    for descid, bc in (op.GetUserDataContainer() or []):
+        if bc and bc.GetString(c4d.DESC_NAME) == UD_LINK_NAME:
+            return descid
+    bc = c4d.GetCustomDatatypeDefault(c4d.DTYPE_BASELISTLINK)
+    bc[c4d.DESC_NAME] = UD_LINK_NAME
+    return op.AddUserData(bc)
+
+def _ensure_angle_ud(op, default=0.0):
+    """
+    UV Rotate (°) — Float Slider in degrees (values are stored internally in radians).
+    Step = 90°, limits = [-180°, +180°]. Updates an existing UD in-place.
+    """
+    existing_did, existing_val = None, None
+    for did, bc_old in (op.GetUserDataContainer() or []):
+        if bc_old and bc_old.GetString(c4d.DESC_NAME) == UD_UV_ANGLE_NAME:
+            existing_did = did
+            try: existing_val = float(op[did])
+            except Exception: existing_val = None
+            break
+
+    bc = c4d.GetCustomDataTypeDefault(c4d.DTYPE_REAL)
+    bc[c4d.DESC_NAME]      = UD_UV_ANGLE_NAME
+    bc[c4d.DESC_UNIT]      = c4d.DESC_UNIT_DEGREE     # shows ° in UI (stored as radians)
+    bc[c4d.DESC_CUSTOMGUI] = c4d.CUSTOMGUI_REALSLIDER # float slider
+
+    # IMPORTANT: step/limits in RADIANS (degree UIs store/expect radians)
+    min_rad = utils.DegToRad(-180.0)
+    max_rad = utils.DegToRad( 180.0)
+    bc[c4d.DESC_MIN]       = min_rad
+    bc[c4d.DESC_MAX]       = max_rad
+    bc[c4d.DESC_MINSLIDER] = min_rad
+    bc[c4d.DESC_MAXSLIDER] = max_rad
+    bc[c4d.DESC_STEP]      = utils.DegToRad(90.0)
+
+    if existing_did:
+        op.SetUserDataContainer(existing_did, bc)
+        did = existing_did
+        val = existing_val if existing_val is not None else utils.DegToRad(float(default))
+    else:
+        did = op.AddUserData(bc)
+        val = utils.DegToRad(float(default))
+
+    # clamp and set current value
+    op[did] = max(min_rad, min(max_rad, float(val)))
+    c4d.EventAdd()
+    return did
+
+# ────────────────────────────── helpers ──────────────────────────────
+
+def _get_children(op):
+    a = op.GetDown()
+    b = a.GetNext() if a else None
+    return a, b  # (profile, path)
+
+def _touch(o):
+    if not o: return
+    o.SetDirty(c4d.DIRTYFLAGS_DATA | c4d.DIRTYFLAGS_MATRIX)
+    o.Message(c4d.MSG_UPDATE)
+
+def _real_spline(obj):
+    """Return a real SplineObject clone (for plain splines or spline-providers)."""
+    if isinstance(obj, c4d.SplineObject):
+        return obj.GetClone(c4d.COPYFLAGS_NO_HIERARCHY)
+    rs = obj.GetRealSpline() if isinstance(obj, c4d.BaseObject) else None
+    return rs.GetClone(c4d.COPYFLAGS_NO_HIERARCHY) if isinstance(rs, c4d.SplineObject) else None
+
+def _explode_segments(spline):
+    """Split a multi-segment spline into separate spline islands."""
+    if not isinstance(spline, c4d.SplineObject):
+        return []
+    tmp = docs.BaseDocument()
+    clone = spline.GetClone(c4d.COPYFLAGS_NO_HIERARCHY)
+    tmp.InsertObject(clone)
+    utils.SendModelingCommand(  # Explode Segments
+        command=c4d.MCOMMAND_EXPLODESEGMENTS,
+        list=[clone],
+        mode=c4d.MODELINGCOMMANDMODE_ALL,
+        bc=c4d.BaseContainer(),
+        doc=tmp
+    )
+    islands = []
+    ch = clone.GetDown()
+    while ch:
+        nxt = ch.GetNext()
+        ch.Remove()
+        islands.append(ch)
+        ch = nxt
+    docs.KillDocument(tmp)
+    return islands  # each is SplineObject
+# (ExplodeSegments ref: SDK MCOMMAND list). :contentReference[oaicite:0]{index=0}
+
+def _copy_sweep_params(src_sw):
+    dst = c4d.BaseObject(c4d.Osweep)
+    src_sw.GetDataInstance().CopyTo(dst.GetDataInstance(), c4d.COPYFLAGS_NONE)
+    dst.SetAllBits(src_sw.GetAllBits())
+    return dst
+
+def _make_sweep_for_bake(src_sw, profile_obj, path_island):
+    """Build a Sweep with REAL clones (profile top, path bottom)."""
+    sw = _copy_sweep_params(src_sw)
+    prof = _real_spline(profile_obj) or profile_obj.GetClone(c4d.COPYFLAGS_NO_HIERARCHY)
+    path = path_island.GetClone(c4d.COPYFLAGS_NO_HIERARCHY)
+    prof.InsertUnder(sw)          # profile ↑
+    path.InsertUnderLast(sw)      # path ↓
+    _touch(prof); _touch(path); _touch(sw)
+    return sw
+
+def _collect_splines_from_hierarchy(root):
+    """Clone all SplineObjects under a hierarchy (no CSTO)."""
+    out = []
+    def walk(o):
+        while o:
+            if isinstance(o, c4d.SplineObject):
+                out.append(o.GetClone(c4d.COPYFLAGS_NO_HIERARCHY))
+            ch = o.GetDown()
+            if ch: walk(ch)
+            o = o.GetNext()
+    if isinstance(root, c4d.BaseObject):
+        walk(root)
+    return out
+
+def _collect_splines_from_cache(obj):
+    """Traverse generator caches to collect splines; avoid cycles with visited set."""
+    res = []
+    if not isinstance(obj, c4d.BaseObject): return res
+
+    def push_children(n, stack):
+        ch = n.GetDown()
+        while ch:
+            stack.append(ch)
+            ch = ch.GetNext()
+
+    visited = set()
+    stack = []
+    if obj.GetCache():        stack.append(obj.GetCache())
+    if obj.GetDeformCache():  stack.append(obj.GetDeformCache())
+
+    while stack:
+        n = stack.pop()
+        while n:
+            nid = id(n)
+            if nid in visited:
+                n = n.GetNext(); continue
+            visited.add(nid)
+
+            if isinstance(n, c4d.SplineObject):
+                res.append(n.GetClone(c4d.COPYFLAGS_NO_HIERARCHY))
+
+            c = n.GetCache()
+            if c and id(c) not in visited: stack.append(c)
+            d = n.GetDeformCache()
+            if d and id(d) not in visited: stack.append(d)
+            push_children(n, stack)
+            n = n.GetNext()
+    return res
+
+def _bake_object_to_splines(obj):
+    """CSTO an object in a temp doc and collect splines from the result (as clones)."""
+    if not isinstance(obj, c4d.BaseObject): return []
+    tmp = docs.BaseDocument()
+    clone = obj.GetClone(0)
+    tmp.InsertObject(clone)
+    try: tmp.ForceCreateBaseDraw()
+    except Exception: pass
+    tmp.ExecutePasses(None, False, True, True, c4d.BUILDFLAGS_NONE)
+
+    res = utils.SendModelingCommand(
+        command=c4d.MCOMMAND_CURRENTSTATETOOBJECT,
+        list=[clone],
+        mode=c4d.MODELINGCOMMANDMODE_ALL,
+        bc=c4d.BaseContainer(),
+        doc=tmp
+    )
+    baked = res[0] if isinstance(res, list) and res else None  # SMC returns list on success. :contentReference[oaicite:1]{index=1}
+    out = _collect_splines_from_hierarchy(baked) if isinstance(baked, c4d.BaseObject) else []
+    docs.KillDocument(tmp)
+    return out
+
+def _islands_from_path(path_obj):
+    """
+    Return a list of single-segment SplineObjects for the path.
+    Order: 1) GetRealSpline, 2) if Connect -> hierarchy splines, 3) caches, 4) fallback CSTO.
+    """
+    if not isinstance(path_obj, c4d.BaseObject):
+        return []
+
+    # 1) direct spline provider
+    sp = _real_spline(path_obj)
+    splines = [sp] if isinstance(sp, c4d.SplineObject) else []
+
+    # 2) Connect as path: pull raw child splines (no CSTO)
+    if not splines and path_obj.CheckType(c4d.Oconnector):
+        splines = _collect_splines_from_hierarchy(path_obj)  # Connect object ID: Oconnector. :contentReference[oaicite:2]{index=2}
+
+    # 3) Otherwise, try caches
+    if not splines:
+        splines = _collect_splines_from_cache(path_obj)
+
+    # 4) Last resort: light bake for non-Connect/non-Sweep
+    if (not splines and not path_obj.CheckType(c4d.Oconnector) and not path_obj.CheckType(c4d.Osweep)):
+        splines = _bake_object_to_splines(path_obj)
+
+    # explode any multi-segment splines into islands
+    islands = []
+    for s in splines:
+        if isinstance(s, c4d.SplineObject) and s.GetSegmentCount() > 1:
+            islands.extend(_explode_segments(s))
+        elif isinstance(s, c4d.SplineObject):
+            islands.append(s)
+    return islands
+
+# ────────────────────────────── bake & post ──────────────────────────────
+
+def _apply_src_phong(src_sw, dst_poly):
+    """Copy Phong params (angle limit, angle, use edges, style) from source Sweep."""
+    if not isinstance(dst_poly, c4d.PolygonObject): return
+    src_tag = src_sw.GetTag(c4d.Tphong)
+    if not src_tag: return
+
+    # remove existing Phong tags on result
+    t = dst_poly.GetFirstTag()
+    while t:
+        nxt = t.GetNext()
+        if t.CheckType(c4d.Tphong):
+            t.Remove()
+        t = nxt
+
+    dst_tag = dst_poly.MakeTag(c4d.Tphong)
+    if not dst_tag: return
+    try:
+        dst_tag[c4d.PHONGTAG_PHONG_ANGLELIMIT] = src_tag[c4d.PHONGTAG_PHONG_ANGLELIMIT]
+        dst_tag[c4d.PHONGTAG_PHONG_ANGLE]      = src_tag[c4d.PHONGTAG_PHONG_ANGLE]
+        dst_tag[c4d.PHONGTAG_PHONG_USEEDGES]   = src_tag[c4d.PHONGTAG_PHONG_USEEDGES]
+        dst_tag[c4d.PHONGTAG_STYLE]            = src_tag[c4d.PHONGTAG_STYLE]
+    except Exception:
+        pass
+    _touch(dst_tag)
+
+def _rotate_uv_of_mesh(mesh, angle_rad):
+    """Rotate all UVW tags around their UV bbox center by angle_rad (radians)."""
+    if not isinstance(mesh, c4d.PolygonObject): return
+    try: ang = float(angle_rad)
+    except Exception: ang = 0.0
+    if abs(ang) < 1e-9: return
+
+    cs, sn = math.cos(ang), math.sin(ang)
+
+    tag = mesh.GetFirstTag()
+    any_rot = False
+    while tag:
+        if tag.CheckType(c4d.Tuvw):
+            uv = tag  # c4d.UVWTag
+            pc = mesh.GetPolygonCount()
+            if pc <= 0 or uv.GetDataCount() != pc:
+                tag = tag.GetNext(); continue
+
+            # UV bbox
+            umin = vmin =  1e9
+            umax = vmax = -1e9
+            for i in range(pc):
+                d = uv.GetSlow(i)  # GetSlow/SetSlow are the canonical API for UVWTag. :contentReference[oaicite:3]{index=3}
+                for k in (d['a'], d['b'], d['c'], d['d']):
+                    umin = min(umin, k.x); umax = max(umax, k.x)
+                    vmin = min(vmin, k.y); vmax = max(vmax, k.y)
+            cx, cy = 0.5*(umin+umax), 0.5*(vmin+vmax)
+
+            # rotate all UVs
+            for i in range(pc):
+                d = uv.GetSlow(i)
+                def rot(p):
+                    ux = p.x - cx; vy = p.y - cy
+                    ru = ux * cs - vy * sn + cx
+                    rv = ux * sn + vy * cs + cy
+                    return c4d.Vector(ru, rv, p.z)
+                a = rot(d['a']); b = rot(d['b']); c = rot(d['c']); d4 = rot(d['d'])
+                uv.SetSlow(i, a, b, c, d4)
+            _touch(uv)
+            any_rot = True
+        tag = tag.GetNext()
+    if any_rot: _touch(mesh)
+
+def _bake_islands_to_poly(src_sw, profile_obj, islands):
+    """Build Sweeps under Connect → bake to single PolygonObject. Safe temp-doc flow."""
+    if not islands: return None
+
+    tmp = docs.BaseDocument()
+    conn = c4d.BaseObject(c4d.Oconnector)  # Connect generator. :contentReference[oaicite:4]{index=4}
+    conn[c4d.CONNECTOBJECT_WELD] = False
+    conn[c4d.CONNECTOBJECT_TOLERANCE] = 0.0
+    tmp.InsertObject(conn)
+
+    # Build sweeps (REAL clones)
+    for isl in islands:
+        sw = _make_sweep_for_bake(src_sw, profile_obj, isl)
+        sw.InsertUnderLast(conn)
+
+    # Evaluate caches in temp doc
+    try: tmp.ForceCreateBaseDraw()
+    except Exception: pass
+    tmp.ExecutePasses(None, False, True, True, c4d.BUILDFLAGS_NONE)
+
+    # 1) Current State To Object (returns list of objects)
+    res = utils.SendModelingCommand(
+        command=c4d.MCOMMAND_CURRENTSTATETOOBJECT,
+        list=[conn],
+        mode=c4d.MODELINGCOMMANDMODE_ALL,
+        bc=c4d.BaseContainer(),
+        doc=tmp
+    )
+    baked = res[0] if isinstance(res, list) and res else None  # SendModelingCommand returns copies. :contentReference[oaicite:5]{index=5}
+
+    # If CSTO yields a Null with polygon children, JOIN them into one mesh
+    if baked and not isinstance(baked, c4d.PolygonObject):
+        polys = []
+        def walk(o):
+            while o:
+                if isinstance(o, c4d.PolygonObject): polys.append(o)
+                ch = o.GetDown()
+                if ch: walk(ch)
+                o = o.GetNext()
+        walk(baked)
+        if len(polys) > 1:
+            joined = utils.SendModelingCommand(
+                command=c4d.MCOMMAND_JOIN,
+                list=polys,
+                mode=c4d.MODELINGCOMMANDMODE_ALL,
+                bc=c4d.BaseContainer(),
+                doc=tmp
+            )
+            baked = joined[0] if isinstance(joined, list) and joined else (joined if isinstance(joined, c4d.BaseObject) else polys[0])
+        elif len(polys) == 1:
+            baked = polys[0]
+
+    # 2) Fallback: Make Editable
+    if baked is None:
+        res = utils.SendModelingCommand(
+            command=c4d.MCOMMAND_MAKEEDITABLE,
+            list=[conn],
+            mode=c4d.MODELINGCOMMANDMODE_ALL,
+            bc=c4d.BaseContainer(),
+            doc=tmp
+        )
+        baked = res[0] if isinstance(res, list) and res else None
+
+    if not isinstance(baked, c4d.BaseObject):
+        docs.KillDocument(tmp)
+        return None
+
+    # Detach from temp doc: clone + strip TextureTags (avoid dead material refs)
+    baked_clone = baked.GetClone(0)
+    tg = baked_clone.GetFirstTag()
+    while tg:
+        nxt = tg.GetNext()
+        if tg.CheckType(c4d.Ttexture):
+            tg.Remove()
+        tg = nxt
+
+    docs.KillDocument(tmp)
+    return baked_clone if isinstance(baked_clone, c4d.PolygonObject) else None
+
+# ────────────────────────────── main ──────────────────────────────
+
+def main():
+    # Ensure UDs
+    ud_link  = _ensure_link_ud(op)
+    ud_angle = _ensure_angle_ud(op, default=0.0)
+
+    src_sw = op[ud_link]
+    if not isinstance(src_sw, c4d.BaseObject) or not src_sw.CheckType(c4d.Osweep):
+        n = c4d.BaseObject(c4d.Onull); n.SetName("Укажи Source Sweep в User Data"); return n
+
+    # top=profile, bottom=path (strict)
+    profile_obj, path_obj = _get_children(src_sw)
+    if not profile_obj or not path_obj:
+        n = c4d.BaseObject(c4d.Onull); n.SetName("В Source Sweep нужны 2 ребёнка: (верх=профиль, низ=путь)"); return n
+
+    # Recompute on edits to these sources
+    try:
+        op.NewDependenceList()
+        op.AddDependence(src_sw)
+        op.AddDependence(profile_obj)
+        op.AddDependence(path_obj)
+        op.TouchDependenceList()
+    except Exception:
+        pass
+
+    # Build islands for path (supports Connect as path)
+    islands = _islands_from_path(path_obj)
+    if not islands:
+        n = c4d.BaseObject(c4d.Onull); n.SetName("Путь не является (или не даёт) сплайном"); return n
+
+    # Bake to one mesh
+    baked = _bake_islands_to_poly(src_sw, profile_obj, islands)
+    if not isinstance(baked, c4d.PolygonObject):
+        n = c4d.BaseObject(c4d.Onull); n.SetName("Bake failed"); return n
+
+    # Post: UV rotate + Phong
+    angle_rad = float(op[ud_angle]) if ud_angle else 0.0  # radians (degree UI stores radians)
+    _rotate_uv_of_mesh(baked, angle_rad)
+    _apply_src_phong(src_sw, baked)
+
+    baked.SetName("Sweep Islands (Mesh)")
+    _touch(baked)
+    return baked
