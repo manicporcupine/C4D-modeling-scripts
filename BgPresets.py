@@ -141,7 +141,7 @@ class PresetModel(gui.TreeViewFunctions):
 
 # --- Dialog --------------------------------------------------------------------
 class PresetDialog(gui.GeDialog):
-    TIMER_DELAY_MS = 20  # delay before the second apply
+    TIMER_DELAY_MS = 150  # delay before the second apply
 
     def __init__(self):
         super().__init__()
