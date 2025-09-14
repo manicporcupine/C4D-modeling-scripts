@@ -84,12 +84,12 @@ def _grab_current_dict():
     }
 
 def _apply_once(it):
-    """Один «проход» применения без таймера."""
+    """One application pass without the timer."""
     bd = _active_bd()
     if not bd:
         return False
 
-    # временно отцепляем аспект, чтобы X/Y не склеивались
+    # temporarily detach aspect ratio so X/Y don't get locked together
     keep_saved = bool(it.get("keep", 1))
     bd[c4d.BASEDRAW_DATA_KEEP_ASPECT] = False
 
@@ -106,7 +106,7 @@ def _apply_once(it):
     bd[c4d.BASEDRAW_DATA_PICTURE_USEALPHA]   = _ALPHA_FROM_TXT.get(it.get("alpha","None"),
                                                                    c4d.BASEDRAW_ALPHA_NONE)
 
-    # возвращаем как было
+    # restore as it was
     bd[c4d.BASEDRAW_DATA_KEEP_ASPECT] = keep_saved
     c4d.EventAdd()
     return True
@@ -141,13 +141,13 @@ class PresetModel(gui.TreeViewFunctions):
 
 # --- Dialog --------------------------------------------------------------------
 class PresetDialog(gui.GeDialog):
-    TIMER_DELAY_MS = 150  # задержка перед «вторым нажатием»
+    TIMER_DELAY_MS = 20  # delay before the second apply
 
     def __init__(self):
         super().__init__()
         self.model = PresetModel()
         self.tree  = None
-        self.pending_apply = None  # dict пресета, который надо применить повторно
+        self.pending_apply = None  # preset dict to re-apply later
         self.timer_armed   = False
 
     def CreateLayout(self):
@@ -174,7 +174,7 @@ class PresetDialog(gui.GeDialog):
         self.tree.SetHeaderText(1, "Presets")
         self.tree.SetRoot(None, self.model, None)
         self.tree.Refresh()
-        # на всякий — таймер выключен
+        # just in case — timer disabled
         self.SetTimer(0)
         return True
 
@@ -219,17 +219,17 @@ class PresetDialog(gui.GeDialog):
             # 1-й проход сейчас
             _apply_once(item)
 
-            # подготовим «второе нажатие» через таймер
-            self.pending_apply = dict(item)   # копию, чтобы не изменить ссылку
+            # prepare the "second apply" via timer
+            self.pending_apply = dict(item)   # copy so the reference doesn’t change
             if not self.timer_armed:
-                self.SetTimer(self.TIMER_DELAY_MS)  # каждый X мс будет вызываться Timer()
+                self.SetTimer(self.TIMER_DELAY_MS)  # Timer() will be called every X ms
                 self.timer_armed = True
             return True
 
         return False
 
     def Timer(self, msg):
-        """Будет вызвано через TIMER_DELAY_MS после Apply — делаем повторное применение и глушим таймер."""
+        """Called after TIMER_DELAY_MS following Apply — performs re-apply and disables the timer."""
         if not self.timer_armed:
             return
 
@@ -237,11 +237,11 @@ class PresetDialog(gui.GeDialog):
             _apply_once(self.pending_apply)
             self.pending_apply = None
 
-        # отключаем таймер, чтобы не тикал постоянно
+        # disable the timer so it doesn't tick constantly
         self.SetTimer(0)
         self.timer_armed = False
 
-        # обновляем вьюпорт/GUI
+        # refresh viewport/GUI
         c4d.EventAdd()
 
 # --- entry ---------------------------------------------------------------------
